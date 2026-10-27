@@ -1,0 +1,34 @@
+
+config:
+  spout.reset.fetchdate.after: 120
+  topology.max.spout.pending: 10000      # optional, keeps the in-flight count bounded
+  spout.ttl.purgatory: 30
+  spout.min.delay.queries: 100
+  spout.max.delay.queries: 20000
+
+  opensearch.addresses: "localhost:9201"
+  opensearch.status.index.name: "status"
+  opensearch.status.routing: true
+  opensearch.status.routing.fieldname: "key"
+  opensearch.status.bulkActions: 500
+  opensearch.status.flushInterval: "2s"
+  opensearch.status.concurrentRequests: 8
+  opensearch.status.max.buckets: 1000
+  opensearch.status.max.urls.per.bucket: 10
+  opensearch.status.bucket.field: key
+  opensearch.status.bucket.sort.field:
+    - "nextFetchDate"
+    - "url"
+  opensearch.status.global.sort.field: "nextFetchDate"
+  opensearch.status.sample: true
+  opensearch.status.query.timeout: -1
+  opensearch.status.recentDate.increase: -1
+  opensearch.status.recentDate.min.gap: -1
+
+  urlfrontier.host: "localhost"
+  urlfrontier.port: 7071
+  urlfrontier.batch.size: 512
+  urlfrontier.max.buckets: 1000
+  urlfrontier.max.urls.per.bucket: 10
+
+
