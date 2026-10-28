@@ -87,6 +87,8 @@ storm local target/benchmark-0.1-SNAPSHOT.jar org.apache.stormcrawler.persistenc
   baseline benchmark-conf.yaml urldump-mixed.ndjson.gz
 ```
 
+With nothing to store, the throughput is that of the thread reading the input, which depends on the length of the URLs, the presence of metadata and how well the file compresses. Measure the baseline on every input: it can vary by a factor of two or more between files on the same machine.
+
 ### Writes
 
 ```
