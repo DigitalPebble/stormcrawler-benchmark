@@ -174,10 +174,10 @@ docker run -d -p 7071:7071 -e HORIZON_LICENSE ghcr.io/digitalpebble/horizon:0.4.
 
 | Backend | Time | URLs / sec | % of baseline |
 |---|---:|---:|---:|
-| Baseline (no storage) | 3 min 36 s | 779,247 | 100% |
-| Horizon 0.4.0 | 7 min 20 s | 382,525 | 49% |
-| URLFrontier 2.7-SNAPSHOT | 13 min 8 s | 213,782 | 27% |
-| OpenSearch 3.9.0 | 46 min 25 s | 60,457 | 7.8% |
+| Baseline (no storage) | 44 s | 3,808,892 | 100% |
+| Horizon 0.4.0 | 7 min 20 s | 382,525 | 10% |
+| URLFrontier 2.7-SNAPSHOT | 13 min 8 s | 213,782 | 5.6% |
+| OpenSearch 3.9.0 | 46 min 25 s | 60,457 | 1.6% |
 
 OpenSearch failed 111 URLs: their `metadata.anchor` was longer than the 32,766 bytes Lucene allows for a term. Both OpenSearch and URLFrontier ended up holding about 40.1M URLs.
 
