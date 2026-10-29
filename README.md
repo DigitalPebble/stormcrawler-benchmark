@@ -80,7 +80,7 @@ sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 
 ### Baseline
 
-Passing `baseline` instead of a class name acks the URLs as soon as they're received, without storing them. This gives the highest throughput the utility can report on that input and machine. The result for a backend can then be expressed as a fraction of the baseline. That ratio, unlike the raw figures, can be compared across machines. Use the same input and number of instances as for the real runs.
+Passing `baseline` instead of a class name acks the URLs as soon as they're received, without storing them. This gives the highest throughput the utility can report on that input and machine. It is not something to compare the backends against: it is a check that the harness isn't the limit. If a backend lands anywhere near it, the figure is about the utility rather than the store. Use the same input and number of instances as for the real runs.
 
 ```bash
 storm local target/benchmark-0.1-SNAPSHOT.jar org.apache.stormcrawler.persistence.StatusUpdaterBenchmark \
@@ -172,23 +172,24 @@ docker run -d -p 7071:7071 -e HORIZON_LICENSE ghcr.io/digitalpebble/horizon:0.4.
 
 ### Writes
 
-| Backend | Time | URLs / sec | % of baseline |
+| Backend | Time | URLs / sec | vs OpenSearch |
 |---|---:|---:|---:|
-| Baseline (no storage) | 44 s | 3,808,892 | 100% |
-| Horizon 0.4.0 | 7 min 20 s | 382,525 | 10% |
-| URLFrontier 2.7-SNAPSHOT | 13 min 8 s | 213,782 | 5.6% |
-| OpenSearch 3.9.0 | 46 min 25 s | 60,457 | 1.6% |
+| Horizon 0.4.0 | 7 min 20 s | 382,525 | 6.3x |
+| URLFrontier 2.7-SNAPSHOT | 13 min 8 s | 213,782 | 3.5x |
+| OpenSearch 3.9.0 | 46 min 25 s | 60,457 | 1x |
+
+The harness writing to nothing managed 3,808,892 URLs / sec in 44 s on the same input, ten times the fastest backend, so none of these figures is bounded by the utility.
 
 OpenSearch failed 111 URLs: their `metadata.anchor` was longer than the 32,766 bytes Lucene allows for a term. Both OpenSearch and URLFrontier ended up holding about 40.1M URLs.
 
 ### Reads
 
-| Backend / spout | Unique URLs / sec | Unique URLs in 3 min |
-|---|---:|---:|
-| Horizon 0.4.0 | 51,431 | 9,262,965 |
-| URLFrontier 2.7-SNAPSHOT | 34,790 | 6,262,251 |
-| OpenSearch 3.9.0, `HybridSpout` | 5,242 | 943,658 |
-| OpenSearch 3.9.0, `AggregationSpout` | 3,021 | 543,833 |
+| Backend / spout | Unique URLs / sec | Unique URLs in 3 min | vs `HybridSpout` |
+|---|---:|---:|---:|
+| Horizon 0.4.0 | 51,431 | 9,262,965 | 9.8x |
+| URLFrontier 2.7-SNAPSHOT | 34,790 | 6,262,251 | 6.6x |
+| OpenSearch 3.9.0, `HybridSpout` | 5,242 | 943,658 | 1x |
+| OpenSearch 3.9.0, `AggregationSpout` | 3,021 | 543,833 | 0.58x |
 
 In all four runs every URL emitted was unique: no backend handed out the same URL twice.
 
