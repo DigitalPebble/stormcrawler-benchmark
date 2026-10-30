@@ -35,7 +35,9 @@ mvn -q package -DskipTests
 
 The utilities must be run with `storm local`. Storm is a provided dependency, so `java -cp` fails with a `NoClassDefFoundError`.
 
-`run-benchmark.sh` asks URLFrontier and Horizon how many URLs they ended up holding, which it does with the `uf` command from the [urlfrontier client](https://github.com/DigitalPebble/urlfrontier-client). That is a program of its own rather than part of this repository, so if it isn't on the PATH the script fetches the release build for the platform it is running on, checks it against the `sha256` published beside it and keeps it in `tools/`. Only the first run pays for that, and a run that includes neither frontier never asks for it.
+`run-benchmark.sh` asks URLFrontier and Horizon how many URLs they ended up holding, which it does with the `uf` command from the [urlfrontier client](https://github.com/DigitalPebble/urlfrontier-client). That is a program of its own rather than part of this repository, so if it isn't on the PATH the script fetches the release build for the platform it is running on, checks it against the `sha256` published beside it and keeps it in `tools/`. Only the first run pays for that, and a run that includes neither frontier never asks for it. The figures are read as JSON, so `jq` has to be there too.
+
+The script needs a client with `get-stats --json`, which is newer than the latest release: until the next one, build it from source with the `cargo install` below and point `UF_CLIENT` at it. A fetched client is checked for it and the run stops before it starts if it is too old.
 
 | Setting | What it does |
 |---|---|
@@ -165,7 +167,7 @@ Each run writes to a directory of its own, `runs/<timestamp>`, so that nothing o
 
 Both CSVs have the columns of `container-stats.sh`, so `avg-stats.sh` reads either. For the harness, the memory is the resident size of the JVM and its percentage is a share of the host's RAM rather than of a container limit.
 
-After the writes and again after the reads, each backend is asked how many URLs it is holding: OpenSearch through `_cat/indices`, the two frontiers through `uf get-stats`. Every backend is fed the same file, so the figures should agree. The first one measured becomes the reference, the rest are compared against it, and the difference goes into `summary.txt` either way. A backend that disagrees is a warning in `run.log` rather than a reason to stop the chain. Set `EXPECTED_URLS` to say up front what the figure should be, which is what to do when running a single backend on its own.
+After the writes and again after the reads, each backend is asked how many URLs it is holding: OpenSearch through `_cat/indices`, the two frontiers through `uf get-stats --json`. A frontier reports the URLs it still has to crawl separately from the ones it has finished with, and the client gives their total, which is the figure comparable with the document count of an index, holding one document per URL whatever its status. Every backend is fed the same file, so the figures should agree. The first one measured becomes the reference, the rest are compared against it, and the difference goes into `summary.txt` either way. A backend that disagrees is a warning in `run.log` rather than a reason to stop the chain. Set `EXPECTED_URLS` to say up front what the figure should be, which is what to do when running a single backend on its own.
 
 Each backend keeps its data in a directory of its own under `bench-data`, mounted into the container, so that the space it uses can be measured with `du`. It is measured after the writes and again once the container has stopped, which is the figure to compare: RocksDB only writes out what it holds in memory on a clean shutdown, and OpenSearch keeps a translog until it is flushed. OpenSearch is flushed before being measured and its own view of the index is recorded as well.
 

@@ -30,10 +30,10 @@
 # stay under /data/crawl, which is where the data directory is mounted.
 #
 # After the writes and again after the reads, each backend is asked how many URLs it is holding:
-# OpenSearch through _cat/indices, the two frontiers through `uf get-stats` from the urlfrontier
-# client. All three are fed the same file, so the figures should agree; the first one measured
-# becomes the reference and a backend that disagrees with it is reported as a warning rather than
-# stopping the run.
+# OpenSearch through _cat/indices, the two frontiers through `uf get-stats --json` from the
+# urlfrontier client. All three are fed the same file, so the figures should agree; the first
+# one measured becomes the reference and a backend that disagrees with it is reported as a
+# warning rather than stopping the run.
 #
 # Every backend keeps its data in a directory of its own under bench-data, mounted into the
 # container, so that the space it uses can be measured with du. OpenSearch is flushed before being
@@ -57,7 +57,8 @@
 #   STATS_INTERVAL=2                seconds between samples
 #   UF_CLIENT=uf                    urlfrontier client, used to read the frontiers' own stats.
 #                                   When it isn't on the PATH the release build for this platform
-#                                   is fetched and kept under UF_CLIENT_DIR
+#                                   is fetched and kept under UF_CLIENT_DIR. It has to be one with
+#                                   `get-stats --json`, which is newer than the latest release
 #   UF_CLIENT_VERSION=              version to fetch, the latest release when left empty
 #   UF_CLIENT_DIR=tools             where a fetched client is kept between runs
 #   EXPECTED_URLS=                  URLs every backend should end up holding; by default the
@@ -210,17 +211,24 @@ port_free() {
 # its own right rather than part of this repository. When it isn't on the PATH, the release build
 # for this platform is fetched, checked against the sha256 published beside it and kept under
 # UF_CLIENT_DIR, so only the first run pays for it. Set UF_CLIENT to use a copy you already have.
+#
+# The stats are read as JSON, which the client has gained since its last release, so a fetched one
+# will not do yet: until the next release, build it from source and point UF_CLIENT at it.
 need_uf_client() {
-  if command -v "$UF_CLIENT" > /dev/null; then
-    return 0
+  command -v jq > /dev/null || die "jq is not on the PATH, the frontier stats are read as JSON"
+  if ! command -v "$UF_CLIENT" > /dev/null; then
+    if [[ -x $UF_CLIENT_DIR/uf ]]; then
+      UF_CLIENT="$UF_CLIENT_DIR/uf"
+      log "urlfrontier client: $UF_CLIENT"
+    else
+      fetch_uf_client
+      UF_CLIENT="$UF_CLIENT_DIR/uf"
+    fi
   fi
-  if [[ -x $UF_CLIENT_DIR/uf ]]; then
-    UF_CLIENT="$UF_CLIENT_DIR/uf"
-    log "urlfrontier client: $UF_CLIENT"
-    return 0
-  fi
-  fetch_uf_client
-  UF_CLIENT="$UF_CLIENT_DIR/uf"
+  "$UF_CLIENT" get-stats --help 2> /dev/null | grep -q -- --json \
+    || die "the urlfrontier client at $UF_CLIENT has no 'get-stats --json', which is how this" \
+      "script reads the frontier stats; build it from https://github.com/$UF_CLIENT_REPO" \
+      "(cargo install --git) and set UF_CLIENT to it"
 }
 
 # sha256sum on Linux, shasum on macOS
@@ -428,17 +436,25 @@ os_index_stats() {
   check_count "$backend" "$label" "$(printf '%s' "$line" | awk '{print $1}')"
 }
 
-# what the frontier itself reports, read with the urlfrontier client over the published port
+# What the frontier itself reports, read with the urlfrontier client over the published port. The
+# client prints the stats as JSON keyed by crawl ID, giving the URLs still to be crawled, the ones
+# the frontier has finished with and the total of the two. That total is the figure to compare
+# with the document count of an index, which holds one document per URL whatever its status.
 frontier_stats() {
   local backend=$1 label=$2 out
-  if ! out=$("$UF_CLIENT" --host localhost --port "$UF_PORT" get-stats 2>&1); then
+  if ! out=$("$UF_CLIENT" --host localhost --port "$UF_PORT" get-stats --json 2>&1); then
     log "could not read the stats from $backend $label: $out"
     return 0
   fi
   say "frontier stats $label:"
   printf '%s\n' "$out" | sed 's/^/  /' >> "$OUTDIR/summary.txt"
-  printf '%s\n' "$out" | sed 's/^/stats\t/' >> "$OUTDIR/$backend-disk.txt"
-  check_count "$backend" "$label" "$(printf '%s' "$out" | awk '/^URLs:/ {print $2}')"
+  # the disk file has a line per figure, so the JSON goes in on one line
+  printf '%s\n' "$out" | jq -c . 2> /dev/null | sed 's/^/stats\t/' \
+    >> "$OUTDIR/$backend-disk.txt" || true
+
+  # a run uses the one crawl, but add up whatever crawls are there rather than assume its ID
+  check_count "$backend" "$label" \
+    "$(printf '%s' "$out" | jq '[.[].urls.total] | add' 2> /dev/null)"
 }
 
 # Every backend is fed the same file, so they should all end up holding the same number of URLs.
@@ -612,7 +628,7 @@ run_backend() {
       ;;
     opensearch)
       sup=org.apache.stormcrawler.opensearch.persistence.StatusUpdaterBolt
-      spout=org.apache.stormcrawler.opensearch.persistence.AggregationSpout
+      spout=org.apache.stormcrawler.opensearch.persistence.HybridSpout
       ;;
     urlfrontier | horizon)
       sup=org.apache.stormcrawler.urlfrontier.StatusUpdaterBolt
