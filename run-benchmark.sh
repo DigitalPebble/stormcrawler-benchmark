@@ -29,6 +29,12 @@
 # the service with -c, so the tuning it holds is what the benchmark measures. Its rocksdb.path must
 # stay under /data/crawl, which is where the data directory is mounted.
 #
+# After the writes and again after the reads, each backend is asked how many URLs it is holding:
+# OpenSearch through _cat/indices, the two frontiers through `uf get-stats` from the urlfrontier
+# client. All three are fed the same file, so the figures should agree; the first one measured
+# becomes the reference and a backend that disagrees with it is reported as a warning rather than
+# stopping the run.
+#
 # Every backend keeps its data in a directory of its own under bench-data, mounted into the
 # container, so that the space it uses can be measured with du. OpenSearch is flushed before being
 # measured and its own view of the index is kept too; for the frontiers the figure is the RocksDB
@@ -49,6 +55,14 @@
 #   KEEP_DATA=0                     1 keeps each backend's data directory after its run
 #   OUTDIR=runs/<timestamp>         same as -o
 #   STATS_INTERVAL=2                seconds between samples
+#   UF_CLIENT=uf                    urlfrontier client, used to read the frontiers' own stats.
+#                                   When it isn't on the PATH the release build for this platform
+#                                   is fetched and kept under UF_CLIENT_DIR
+#   UF_CLIENT_VERSION=              version to fetch, the latest release when left empty
+#   UF_CLIENT_DIR=tools             where a fetched client is kept between runs
+#   EXPECTED_URLS=                  URLs every backend should end up holding; by default the
+#                                   first backend measured sets the figure the others are checked
+#                                   against
 
 set -euo pipefail
 
@@ -71,6 +85,11 @@ STATS_INTERVAL=${STATS_INTERVAL:-2}
 DROP_CACHES=${DROP_CACHES:-1}
 SWAPOFF=${SWAPOFF:-1}
 KEEP_DATA=${KEEP_DATA:-0}
+
+UF_CLIENT=${UF_CLIENT:-uf}
+UF_CLIENT_VERSION=${UF_CLIENT_VERSION:-}
+UF_CLIENT_DIR=${UF_CLIENT_DIR:-$PWD/tools}
+UF_CLIENT_REPO=DigitalPebble/urlfrontier-client
 
 DATA_ROOT=${DATA_ROOT:-bench-data}
 OUTDIR=${OUTDIR:-runs/$(date +%Y%m%d-%H%M%S)}
@@ -128,6 +147,8 @@ fi
 CONTAINER=
 STATS_PIDS=()
 SUDO_KEEPALIVE=
+REFERENCE_URLS=${EXPECTED_URLS:-}
+REFERENCE_FROM="EXPECTED_URLS"
 
 log() {
   printf '%s  %s\n' "$(date +%T)" "$*" | tee -a "$OUTDIR/run.log"
@@ -168,11 +189,13 @@ check() {
         [[ -f $INPUT ]] || die "input $INPUT not found"
         [[ -f $UF_CONFIG ]] || die "$UF_CONFIG not found, URLFrontier is run with it mounted"
         port_free "$UF_PORT" || die "something is already listening on $UF_PORT"
+        need_uf_client
         ;;
       horizon)
         [[ -f $INPUT ]] || die "input $INPUT not found"
         [[ -n ${HORIZON_LICENSE:-} ]] || die "HORIZON_LICENSE is not set, Horizon needs it"
         port_free "$UF_PORT" || die "something is already listening on $UF_PORT"
+        need_uf_client
         ;;
       *) die "unknown backend '$backend', expected baseline, opensearch, urlfrontier or horizon" ;;
     esac
@@ -181,6 +204,83 @@ check() {
 
 port_free() {
   ! (exec 3<> "/dev/tcp/127.0.0.1/$1") 2> /dev/null
+}
+
+# The frontiers are asked for their own figures with the urlfrontier client, which is a program in
+# its own right rather than part of this repository. When it isn't on the PATH, the release build
+# for this platform is fetched, checked against the sha256 published beside it and kept under
+# UF_CLIENT_DIR, so only the first run pays for it. Set UF_CLIENT to use a copy you already have.
+need_uf_client() {
+  if command -v "$UF_CLIENT" > /dev/null; then
+    return 0
+  fi
+  if [[ -x $UF_CLIENT_DIR/uf ]]; then
+    UF_CLIENT="$UF_CLIENT_DIR/uf"
+    log "urlfrontier client: $UF_CLIENT"
+    return 0
+  fi
+  fetch_uf_client
+  UF_CLIENT="$UF_CLIENT_DIR/uf"
+}
+
+# sha256sum on Linux, shasum on macOS
+sha256_of() {
+  if command -v sha256sum > /dev/null; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+fetch_uf_client() {
+  local os arch target version base archive tmp want got
+  case "$(uname -s)" in
+    Linux) os=unknown-linux-gnu ;;
+    Darwin) os=apple-darwin ;;
+    *) die "the urlfrontier client has no release build for $(uname -s), install it from https://github.com/$UF_CLIENT_REPO and set UF_CLIENT" ;;
+  esac
+  case "$(uname -m)" in
+    x86_64 | amd64) arch=x86_64 ;;
+    aarch64 | arm64) arch=aarch64 ;;
+    *) die "the urlfrontier client has no release build for $(uname -m), install it from https://github.com/$UF_CLIENT_REPO and set UF_CLIENT" ;;
+  esac
+  target=$arch-$os
+
+  # the asset names carry the version, so the latest one has to be resolved before downloading
+  version=$UF_CLIENT_VERSION
+  if [[ -z $version ]]; then
+    version=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+      "https://github.com/$UF_CLIENT_REPO/releases/latest") \
+      || die "could not reach the releases of $UF_CLIENT_REPO, set UF_CLIENT_VERSION or UF_CLIENT"
+    version=${version##*/}
+    [[ -n $version && $version != latest ]] \
+      || die "could not work out the latest version of the urlfrontier client, set UF_CLIENT_VERSION"
+  fi
+
+  base="https://github.com/$UF_CLIENT_REPO/releases/download/$version"
+  archive="uf-$version-$target.tar.gz"
+  tmp=$(mktemp -d)
+
+  log "fetching the urlfrontier client $version for $target"
+  curl -fsSL -o "$tmp/$archive" "$base/$archive" \
+    || { rm -rf "$tmp"; die "could not download $base/$archive"; }
+  curl -fsSL -o "$tmp/sha256" "$base/uf-$version-$target.sha256" \
+    || { rm -rf "$tmp"; die "could not download the checksum of $archive"; }
+
+  want=$(awk '{print $1; exit}' "$tmp/sha256")
+  got=$(sha256_of "$tmp/$archive")
+  if [[ -z $want || $want != "$got" ]]; then
+    rm -rf "$tmp"
+    die "the checksum of $archive is not the one the release publishes, refusing to use it"
+  fi
+
+  tar -xzf "$tmp/$archive" -C "$tmp" uf \
+    || { rm -rf "$tmp"; die "no uf binary inside $archive"; }
+  mkdir -p "$UF_CLIENT_DIR"
+  mv "$tmp/uf" "$UF_CLIENT_DIR/uf"
+  chmod +x "$UF_CLIENT_DIR/uf"
+  rm -rf "$tmp"
+  log "urlfrontier client $version kept at $UF_CLIENT_DIR/uf"
 }
 
 need_sudo() {
@@ -318,13 +418,50 @@ measure_disk() {
 
 # what OpenSearch itself reports, which counts the segments rather than the directory
 os_index_stats() {
-  local backend=$1 line
+  local backend=$1 label=$2 line
   curl -fsS -XPOST "http://localhost:$OS_PORT/status/_flush?wait_if_ongoing=true" > /dev/null 2>&1 || true
   line=$(curl -fsS \
     "http://localhost:$OS_PORT/_cat/indices/status?h=docs.count,docs.deleted,store.size,pri.store.size" \
     2> /dev/null) || return 0
   say "index (docs, deleted, store, primaries): $(printf '%s' "$line" | tr -s ' ')"
   printf 'index\t%s\n' "$(printf '%s' "$line" | tr -s ' ')" >> "$OUTDIR/$backend-disk.txt"
+  check_count "$backend" "$label" "$(printf '%s' "$line" | awk '{print $1}')"
+}
+
+# what the frontier itself reports, read with the urlfrontier client over the published port
+frontier_stats() {
+  local backend=$1 label=$2 out
+  if ! out=$("$UF_CLIENT" --host localhost --port "$UF_PORT" get-stats 2>&1); then
+    log "could not read the stats from $backend $label: $out"
+    return 0
+  fi
+  say "frontier stats $label:"
+  printf '%s\n' "$out" | sed 's/^/  /' >> "$OUTDIR/summary.txt"
+  printf '%s\n' "$out" | sed 's/^/stats\t/' >> "$OUTDIR/$backend-disk.txt"
+  check_count "$backend" "$label" "$(printf '%s' "$out" | awk '/^URLs:/ {print $2}')"
+}
+
+# Every backend is fed the same file, so they should all end up holding the same number of URLs.
+# The first figure measured becomes the reference and the rest are checked against it, unless
+# EXPECTED_URLS says what to expect. A mismatch is worth knowing about but is not a reason to
+# stop the chain, so it is logged as a warning.
+check_count() {
+  local backend=$1 label=$2 count=$3 diff
+  [[ $count =~ ^[0-9]+$ ]] || return 0
+  if [[ -z $REFERENCE_URLS ]]; then
+    REFERENCE_URLS=$count
+    REFERENCE_FROM="$backend $label"
+    say "$(printf 'URLs held %-16s %12s  (the reference for this run)' "$label:" "$count")"
+    log "$backend holds $count URLs $label, the reference for this run"
+    return 0
+  fi
+  diff=$((count - REFERENCE_URLS))
+  say "$(printf 'URLs held %-16s %12s  (%+d against %s)' "$label:" "$count" "$diff" "$REFERENCE_FROM")"
+  if (( diff == 0 )); then
+    log "$backend holds $count URLs $label, the same as $REFERENCE_FROM"
+  else
+    log "WARNING: $backend holds $count URLs $label, $diff against $REFERENCE_FROM ($REFERENCE_URLS)"
+  fi
 }
 
 # ---------------------------------------------------------------- stats
@@ -497,9 +634,10 @@ run_backend() {
 
   run_step "$backend-writes" "$WRITE_CLASS" "$sup" "$WRITE_INSTANCES" "$CONF" "$INPUT"
 
-  if [[ $backend == opensearch ]]; then
-    os_index_stats "$backend"
-  fi
+  case $backend in
+    opensearch) os_index_stats "$backend" "after the writes" ;;
+    urlfrontier | horizon) frontier_stats "$backend" "after the writes" ;;
+  esac
   measure_disk "$backend" "after the writes"
 
   if [[ -z $spout ]]; then
@@ -519,9 +657,10 @@ run_backend() {
   fi
 
   if [[ -n $CONTAINER ]]; then
-    if [[ $backend == opensearch ]]; then
-      os_index_stats "$backend"
-    fi
+    case $backend in
+      opensearch) os_index_stats "$backend" "after the reads" ;;
+      urlfrontier | horizon) frontier_stats "$backend" "after the reads" ;;
+    esac
     docker logs "$CONTAINER" > "$OUTDIR/$backend-container.log" 2>&1 || true
     stop_container
     measure_disk "$backend" "after shutdown"

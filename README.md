@@ -13,7 +13,11 @@ This repository holds the project the utilities are run from (`pom.xml` brings i
 |---|---|
 | `pom.xml` | Crawl project with the dependencies for the backends tested |
 | `benchmark-conf.yaml` | Settings for OpenSearch and URLFrontier, passed to both utilities |
+| `config.ini` | URLFrontier settings, mounted into its container |
 | `generate-input.py` | Generates a synthetic input file |
+| `run-benchmark.sh` | Runs the write and the read benchmark against every backend in turn |
+| `container-stats.sh` | Samples the CPU and memory of a container as CSV |
+| `avg-stats.sh` | Averages a CSV from `container-stats.sh` |
 | `src/main/resources/status.mapping` | Mapping of the OpenSearch status index |
 | `src/main/java/.../DummyStatusUpdater.java` | Status updater that acks without storing, predates the `baseline` option |
 
@@ -30,6 +34,20 @@ mvn -q package -DskipTests
 ```
 
 The utilities must be run with `storm local`. Storm is a provided dependency, so `java -cp` fails with a `NoClassDefFoundError`.
+
+`run-benchmark.sh` asks URLFrontier and Horizon how many URLs they ended up holding, which it does with the `uf` command from the [urlfrontier client](https://github.com/DigitalPebble/urlfrontier-client). That is a program of its own rather than part of this repository, so if it isn't on the PATH the script fetches the release build for the platform it is running on, checks it against the `sha256` published beside it and keeps it in `tools/`. Only the first run pays for that, and a run that includes neither frontier never asks for it.
+
+| Setting | What it does |
+|---|---|
+| `UF_CLIENT` | A copy you already have, used as it is rather than fetching one |
+| `UF_CLIENT_VERSION` | The release to fetch, the latest one by default |
+| `UF_CLIENT_DIR` | Where a fetched client is kept between runs, `tools/` by default |
+
+There are release builds for Linux and macOS on x86_64 and aarch64. On anything else, or with no network, install it yourself and point `UF_CLIENT` at it:
+
+```bash
+cargo install --git https://github.com/DigitalPebble/urlfrontier-client
+```
 
 ## Input
 
@@ -119,6 +137,42 @@ Run it on the backend populated by the write benchmark. Here, 10 spouts and 1 st
 - **The fetch interval must outlast the run.** The URLs go through the scheduler, so `fetchInterval.default` (1440 minutes by default) must be longer than the run, or URLs become due again before it ends.
 - **The unique URLs are held in memory.** Leave enough heap for them.
 
+### Everything in one go
+
+`run-benchmark.sh` chains the steps above for every backend. For each of them it drops the page cache, starts the backend from an empty data directory, runs the write benchmark, then the read one against what the writes left behind, measures the space used and stops the container before moving on to the next. The baseline has neither a container nor a spout, so it only runs the writes.
+
+```bash
+HORIZON_LICENSE=$(cat ~/horizon/digitalPebble.lic) ./run-benchmark.sh
+```
+
+It takes the backends to run as arguments, `baseline opensearch urlfrontier horizon` by default, `-o` for the directory everything is written to, and the rest of the settings from the environment: `INPUT`, `HEAP` (the heap of every JVM backend, `6g`, the same for all of them), `WRITE_INSTANCES`, `READ_MINUTES`, `READ_SPOUTS`, `READ_BOLTS`, `SETTLE_SECS` (idle time between the writes and the reads of a backend), `STATS_INTERVAL`, `KEEP_DATA=1` to keep the data directories, and `DROP_CACHES=0 SWAPOFF=0` to run without sudo.
+
+```bash
+INPUT=synthetic.ndjson.gz READ_MINUTES=5 ./run-benchmark.sh -o synthetic-run opensearch horizon
+```
+
+Each run writes to a directory of its own, `runs/<timestamp>`, so that nothing overwrites an earlier run. Pass `-o` to put it somewhere else (`OUTDIR` in the environment does the same).
+
+| File | What it is |
+|---|---|
+| `<backend>-<writes\|reads>.log` | Output of the utility |
+| `<backend>-<writes\|reads>-backend.csv` | CPU and memory of the backend container, from `container-stats.sh` |
+| `<backend>-<writes\|reads>-harness.csv` | CPU and memory of the storm JVM, sampled from `/proc` |
+| `<backend>-container.log` | Output of the backend container, both steps |
+| `<backend>-disk.txt` | Space the backend used on disk, and the URLs it reported holding |
+| `run.log` | What the script did, with timings |
+| `summary.txt` | The figures of every step, the averages of the CSVs and the disk use |
+
+Both CSVs have the columns of `container-stats.sh`, so `avg-stats.sh` reads either. For the harness, the memory is the resident size of the JVM and its percentage is a share of the host's RAM rather than of a container limit.
+
+After the writes and again after the reads, each backend is asked how many URLs it is holding: OpenSearch through `_cat/indices`, the two frontiers through `uf get-stats`. Every backend is fed the same file, so the figures should agree. The first one measured becomes the reference, the rest are compared against it, and the difference goes into `summary.txt` either way. A backend that disagrees is a warning in `run.log` rather than a reason to stop the chain. Set `EXPECTED_URLS` to say up front what the figure should be, which is what to do when running a single backend on its own.
+
+Each backend keeps its data in a directory of its own under `bench-data`, mounted into the container, so that the space it uses can be measured with `du`. It is measured after the writes and again once the container has stopped, which is the figure to compare: RocksDB only writes out what it holds in memory on a clean shutdown, and OpenSearch keeps a translog until it is flushed. OpenSearch is flushed before being measured and its own view of the index is recorded as well.
+
+URLFrontier is run with `config.ini` mounted into its container and passed to the service with `-c`, so that the tuning it holds is what gets measured; [URLFrontier](#urlfrontier) below has the detail of the two mounts that takes. Horizon is a native binary rather than a JVM, so `HEAP` does not apply to it and it keeps the `config.ini` from its image.
+
+Dropping the page cache and turning swap off need sudo. The script asks for it once at the start and keeps the timestamp alive, so that a write run lasting the best part of an hour doesn't stop for a password prompt. `StatusUpdaterBenchmark` exits 1 when a URL failed, as it does on OpenSearch; the script records the exit code and carries on.
+
 ## Backends
 
 ### OpenSearch
@@ -135,7 +189,7 @@ SUP_CLASS=org.apache.stormcrawler.opensearch.persistence.StatusUpdaterBolt
 SPOUT_CLASS=org.apache.stormcrawler.opensearch.persistence.AggregationSpout   # or HybridSpout
 ```
 
-The status updater creates the `status` index from `src/main/resources/status.mapping` if it doesn't exist. The spouts use sampling (`opensearch.status.sample: true`): without it, the aggregations are too slow on an index this size.
+The status updater creates the `status` index from `src/main/resources/status.mapping` if it doesn't exist. The spouts use sampling (`opensearch.status.sample: true`): without it, the aggregations are too slow on an index this size. Sampling looks at part of the index rather than all of it, so the URLs that come back are urgent ones rather than strictly the most urgent: with it on, the priority order is approximate.
 
 ### URLFrontier
 
@@ -150,6 +204,31 @@ SPOUT_CLASS=org.apache.stormcrawler.urlfrontier.Spout
 ```
 
 The image was built from the [url-frontier](https://github.com/crawler-commons/url-frontier) sources. `crawlercommons/url-frontier:latest` also works.
+
+The image ships no `config.ini` and its entrypoint passes none, so the command above runs the service on its defaults. To benchmark it on the settings in `config.ini`, mount the file in and point the service at it with `-c`, as `run-benchmark.sh` does, with the 6 GB of heap it gives every JVM backend:
+
+```bash
+docker run -d -p 7071:7071 \
+  -v "$PWD/config.ini":/home/urlfrontier/config.ini:ro \
+  -v "$PWD/bench-data/urlfrontier":/data/crawl \
+  --entrypoint java urlfrontier:2.7-SNAPSHOT \
+  -Xms6G -Xmx6G -XX:+UseG1GC -jar urlfrontier-service.jar -c config.ini
+```
+
+| Mounted at | Why there |
+|---|---|
+| `/home/urlfrontier/config.ini` | `/home/urlfrontier` is the image's working directory, so the service finds the file as `-c config.ini`. Read only, nothing writes to it |
+| `/data/crawl` | Where `rocksdb.path` in the file points, so that the store ends up on the host and the space it uses can be measured |
+
+The two go together: the service runs as the user `urlfrontier`, uid 1001, which owns nothing outside its own home directory, so `rocksdb.path` has to point either inside that home or at a directory mounted in and writable by that uid. `run-benchmark.sh` creates the one it mounts mode 777 for that reason. Keep the path in `config.ini` and the mount point in step: if they drift apart, the store stays inside the container and the directory being measured is left empty.
+
+The service logs the path it settled on, which is the quickest way to tell whether it read the file at all:
+
+```
+INFO c.u.service.rocksdb.RocksDBService - RocksDB data stored in /data/crawl/rocksdb
+```
+
+Settings can also be given as `key=value` arguments after the jar, which take precedence over the file.
 
 ### Horizon
 
