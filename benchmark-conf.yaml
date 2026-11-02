@@ -31,4 +31,13 @@ config:
   urlfrontier.max.buckets: 1000
   urlfrontier.max.urls.per.bucket: 10
 
-
+  # solr.status.routing.shards is left to run-benchmark.sh: SolrSpout needs as many instances as
+  # the collection has shards, so the script creates the collection with READ_SPOUTS shards and
+  # passes the figure in a conf file of its own
+  solr.status.url: "http://localhost:8983/solr/status"
+  solr.status.routing.fieldname: "key"
+  solr.status.bucket.field: key
+  solr.status.bucket.maxsize: 10
+  solr.status.max.results: 1000
+  solr.status.batchUpdateSize: 500
+  solr.status.metadata.prefix: metadata
