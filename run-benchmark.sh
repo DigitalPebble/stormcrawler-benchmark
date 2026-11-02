@@ -51,7 +51,9 @@
 #   HEAP=6g                         heap of every JVM backend, same for all of them
 #   READ_MINUTES=3 READ_SPOUTS=10 READ_BOLTS=1 WRITE_INSTANCES=1
 #   SETTLE_SECS=30                  idle time between the writes and the reads of a backend
-#   DROP_CACHES=1 SWAPOFF=1         need sudo; set to 0 to run without it
+#   DROP_CACHES=1 SWAPOFF=1         need sudo; set to 0 to run without it. On macOS the page
+#                                   cache dropped is that of Docker Desktop's VM, which needs no
+#                                   sudo, and SWAPOFF is 0 as the VM's swap is set in Docker Desktop
 #   KEEP_DATA=0                     1 keeps each backend's data directory after its run
 #   OUTDIR=runs/<timestamp>         same as -o
 #   STATS_INTERVAL=2                seconds between samples
@@ -66,6 +68,9 @@
 #                                   against
 
 set -euo pipefail
+
+# awk follows the locale, which can make the decimal separator a comma and break the CSVs
+export LC_ALL=C
 
 cd "$(dirname "$(readlink -f "$0")")"
 
@@ -83,8 +88,14 @@ HEAP=${HEAP:-6g}
 SETTLE_SECS=${SETTLE_SECS:-30}
 READY_TIMEOUT=${READY_TIMEOUT:-300}
 STATS_INTERVAL=${STATS_INTERVAL:-2}
+# On macOS the containers run in Docker Desktop's VM and there is no /proc on the host
+DARWIN=0
+if [[ $(uname -s) == Darwin ]]; then
+  DARWIN=1
+fi
+
 DROP_CACHES=${DROP_CACHES:-1}
-SWAPOFF=${SWAPOFF:-1}
+SWAPOFF=${SWAPOFF:-$((1 - DARWIN))}
 KEEP_DATA=${KEEP_DATA:-0}
 
 UF_CLIENT=${UF_CLIENT:-uf}
@@ -292,7 +303,7 @@ fetch_uf_client() {
 }
 
 need_sudo() {
-  (( DROP_CACHES || SWAPOFF )) || return 0
+  (( (DROP_CACHES && ! DARWIN) || SWAPOFF )) || return 0
   sudo -v || die "sudo is needed to drop the page cache, set DROP_CACHES=0 SWAPOFF=0 to skip it"
   # the write benchmark can run for the best part of an hour, keep the timestamp alive so that
   # nothing asks for a password in the middle of the chain
@@ -309,8 +320,15 @@ drop_caches() {
     return 0
   fi
   sync
-  echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
-  log "page cache dropped"
+  if (( DARWIN )); then
+    # the backends read and write through the page cache of Docker Desktop's VM rather than the
+    # host's, and a privileged container can drop it without sudo
+    docker run --rm --privileged "$WIPE_IMAGE" sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'
+    log "page cache of the Docker VM dropped"
+  else
+    echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+    log "page cache dropped"
+  fi
 }
 
 # ---------------------------------------------------------------- backend containers
@@ -486,6 +504,20 @@ check_count() {
 proc_sample() {
   local pids p line rest ticks=0 pages=0
   pids=$(pid_tree "$1")
+  if (( DARWIN )); then
+    # no /proc: the CPU time as [[dd-]hh:]mm:ss.ss and the RSS in KiB, from ps
+    # shellcheck disable=SC2086 # one pid per word, joined with commas
+    ps -o time=,rss= -p "$(printf '%s,' $pids)" 2> /dev/null |
+      awk -v hz="$hz" -v page="$page" '{
+        days = 0; t = $1
+        if (index(t, "-")) { days = substr(t, 1, index(t, "-") - 1); t = substr(t, index(t, "-") + 1) }
+        n = split(t, f, ":"); secs = 0
+        for (i = 1; i <= n; i++) secs = secs * 60 + f[i]
+        ticks += (days * 86400 + secs) * hz
+        pages += $2 * 1024 / page
+      } END { printf "%d %d\n", ticks, pages }'
+    return 0
+  fi
   for p in $pids; do
     [[ -r /proc/$p/stat ]] || continue
     line=$(< "/proc/$p/stat") || continue
@@ -506,16 +538,29 @@ pid_tree() {
   done
 }
 
+# A clock in seconds with a fractional part, for the time between two samples
+uptime_secs() {
+  if (( DARWIN )); then
+    perl -MTime::HiRes=time -e 'printf "%.2f\n", time'
+  else
+    cut -d' ' -f1 /proc/uptime
+  fi
+}
+
 # Same columns as container-stats.sh, for a process tree rather than a container
 harness_stats() {
   local pid=$1 out=$2 hz page mem_kb t0 t1 u0 u1 sample pages
   hz=$(getconf CLK_TCK)
   page=$(getconf PAGESIZE)
-  mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  if (( DARWIN )); then
+    mem_kb=$(($(sysctl -n hw.memsize) / 1024))
+  else
+    mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  fi
 
   echo "time,cpu_perc,mem_mib,mem_perc" > "$out"
   t0=$(proc_sample "$pid" | cut -d' ' -f1)
-  u0=$(cut -d' ' -f1 /proc/uptime)
+  u0=$(uptime_secs)
 
   while kill -0 "$pid" 2> /dev/null; do
     sleep "$STATS_INTERVAL"
@@ -523,7 +568,7 @@ harness_stats() {
     sample=$(proc_sample "$pid")
     t1=${sample% *}
     pages=${sample#* }
-    u1=$(cut -d' ' -f1 /proc/uptime)
+    u1=$(uptime_secs)
     if (( t1 < t0 )); then
       break
     fi
@@ -544,7 +589,11 @@ find_java_pid() {
   local class=$1 deadline=$((SECONDS + 120)) pid exe
   while (( SECONDS < deadline )); do
     for pid in $(pgrep -f "$class" 2> /dev/null); do
-      exe=$(readlink -f "/proc/$pid/exe" 2> /dev/null) || continue
+      if (( DARWIN )); then
+        exe=$(ps -o comm= -p "$pid" 2> /dev/null) || continue
+      else
+        exe=$(readlink -f "/proc/$pid/exe" 2> /dev/null) || continue
+      fi
       if [[ ${exe##*/} == java ]]; then
         printf '%s\n' "$pid"
         return 0
@@ -716,17 +765,29 @@ trap 'log "interrupted"; exit 130' INT TERM
 
 check
 
+if (( SWAPOFF && DARWIN )); then
+  die "swap can't be turned off on macOS, set the swap of Docker Desktop's VM in its settings and SWAPOFF=0"
+fi
+
 # once for the whole chain, the page cache is the only thing dropped again for each backend
 need_sudo
-docker context use default > /dev/null 2>&1
+# on macOS the default context is not necessarily Docker Desktop's, leave the current one alone
+if (( ! DARWIN )); then
+  docker context use default > /dev/null 2>&1
+fi
 if (( SWAPOFF )); then
   sudo swapoff -a
   log "swap off"
 fi
 
 {
-  echo "# $(date -Is)  $(hostname)"
-  echo "kernel $(uname -r), $(nproc) threads, $(free -g | awk '/^Mem:/ {print $2}') GiB RAM"
+  echo "# $(date +%Y-%m-%dT%H:%M:%S%z)  $(hostname)"
+  if (( DARWIN )); then
+    echo "macOS $(sw_vers -productVersion), $(sysctl -n hw.ncpu) threads, $(($(sysctl -n hw.memsize) / 1073741824)) GiB RAM"
+    echo "docker VM: $(docker info --format '{{.NCPU}} threads, {{.MemTotal}} bytes RAM')"
+  else
+    echo "kernel $(uname -r), $(nproc) threads, $(free -g | awk '/^Mem:/ {print $2}') GiB RAM"
+  fi
   echo "docker $(docker version --format '{{.Server.Version}}')"
   echo "backends: ${BACKENDS[*]}"
   echo "input: $INPUT ($(du -h "$INPUT" | cut -f1))"

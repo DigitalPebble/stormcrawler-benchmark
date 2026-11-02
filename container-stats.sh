@@ -9,6 +9,9 @@
 
 set -euo pipefail
 
+# awk follows the locale, which can make the decimal separator a comma and break the CSVs
+export LC_ALL=C
+
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <container> [interval secs] [output file]" >&2
   exit 1
