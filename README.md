@@ -66,6 +66,8 @@ The order matters. In a crawl, the hosts are interleaved, and discovered and kno
 zcat urls.ndjson.gz | shuf | gzip > shuffled.ndjson.gz
 ```
 
+macOS has no `shuf`: use `gshuf` from Homebrew's `coreutils`, and `gzcat` rather than `zcat`.
+
 ### Synthetic input
 
 `generate-input.py` builds an input of any size, with a set number of queues and of unique URLs per queue. Each queue is a host, `benchmark1.com` … `benchmarkN.com`, whose URLs form a tree with the given fanout, expanded breadth first. The children of a URL are emitted as discovered, then the URL itself as known:
@@ -97,6 +99,18 @@ docker context use default
 sudo swapoff -a
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 ```
+
+#### macOS
+
+`run-benchmark.sh` runs on macOS with Docker Desktop, where the containers run in a Linux VM rather than on the host, which changes a few things:
+
+- The page cache dropped before each backend is the VM's, from a privileged container, so it needs no sudo. Swap can't be turned off, `SWAPOFF` is 0 by default: the VM's swap is set in Docker Desktop's settings, under Resources.
+- The current Docker context is kept, as the `default` one is not necessarily Docker Desktop's.
+- The harness stats come from `ps` rather than `/proc`.
+- The heap given to the backends has to fit in the memory of the VM, also set under Resources: with a VM of 8 GB, lower `HEAP` to `4g`.
+- `bench-data` is on the host and shared with the VM, which makes the backends' disk access slower than on Linux. Keep that in mind when comparing figures across platforms.
+
+The shell that ships with macOS is bash 3.2, which the scripts work with.
 
 ### Baseline
 
