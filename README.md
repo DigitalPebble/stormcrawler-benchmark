@@ -5,20 +5,21 @@ A template for benchmarking the status backends of [Apache StormCrawler](https:/
 - **`StatusUpdaterBenchmark`** (writes): feeds the URLs from a file to one or more instances of a status updater bolt and measures how many per second are acked.
 - **`SpoutBenchmark`** (reads): runs one or more spouts against a backend that's already populated for a given number of minutes. Every URL emitted is sent back to a status updater as FETCHED, and the utility reports how many *unique* URLs per second were emitted.
 
-This repository holds the project the utilities are run from (`pom.xml` brings in the core, OpenSearch and URLFrontier modules), the configuration, and a script to generate input.
+This repository holds the project the utilities are run from (`pom.xml` brings in the core, OpenSearch, Solr and URLFrontier modules), the configuration, and a script to generate input.
 
 ## Contents
 
 | File | What it is |
 |---|---|
 | `pom.xml` | Crawl project with the dependencies for the backends tested |
-| `benchmark-conf.yaml` | Settings for OpenSearch and URLFrontier, passed to both utilities |
+| `benchmark-conf.yaml` | Settings for OpenSearch, Solr and URLFrontier, passed to both utilities |
 | `config.ini` | URLFrontier settings, mounted into its container |
 | `generate-input.py` | Generates a synthetic input file |
 | `run-benchmark.sh` | Runs the write and the read benchmark against every backend in turn |
 | `container-stats.sh` | Samples the CPU and memory of a container as CSV |
 | `avg-stats.sh` | Averages a CSV from `container-stats.sh` |
 | `src/main/resources/status.mapping` | Mapping of the OpenSearch status index |
+| `solr/status` | Configset of the Solr status collection, from `external/solr/configsets/status` in StormCrawler |
 | `src/main/java/.../DummyStatusUpdater.java` | Status updater that acks without storing, predates the `baseline` option |
 
 ## Build
@@ -26,7 +27,7 @@ This repository holds the project the utilities are run from (`pom.xml` brings i
 The utilities are in `stormcrawler-core` 4.0.0-SNAPSHOT, so install StormCrawler from source first, then build this project:
 
 ```bash
-cd ~/stormcrawler && mvn -q install -DskipTests -pl core,external/urlfrontier,external/opensearch -am
+cd ~/stormcrawler && mvn -q install -DskipTests -pl core,external/urlfrontier,external/opensearch,external/solr -am
 ```
 
 ```bash
@@ -161,7 +162,7 @@ Run it on the backend populated by the write benchmark. Here, 10 spouts and 1 st
 HORIZON_LICENSE=$(cat ~/horizon/digitalPebble.lic) ./run-benchmark.sh
 ```
 
-It takes the backends to run as arguments, `baseline opensearch urlfrontier horizon` by default, `-o` for the directory everything is written to, and the rest of the settings from the environment: `INPUT`, `HEAP` (the heap of every JVM backend, `6g`, the same for all of them), `WRITE_INSTANCES`, `READ_MINUTES`, `READ_SPOUTS`, `READ_BOLTS`, `SETTLE_SECS` (idle time between the writes and the reads of a backend), `STATS_INTERVAL`, `KEEP_DATA=1` to keep the data directories, and `DROP_CACHES=0 SWAPOFF=0` to run without sudo.
+It takes the backends to run as arguments, `baseline opensearch solr urlfrontier horizon` by default, `-o` for the directory everything is written to, and the rest of the settings from the environment: `INPUT`, `HEAP` (the heap of every JVM backend, `6g`, the same for all of them), `WRITE_INSTANCES`, `READ_MINUTES`, `READ_SPOUTS`, `READ_BOLTS`, `SETTLE_SECS` (idle time between the writes and the reads of a backend), `STATS_INTERVAL`, `KEEP_DATA=1` to keep the data directories, and `DROP_CACHES=0 SWAPOFF=0` to run without sudo.
 
 ```bash
 INPUT=synthetic.ndjson.gz READ_MINUTES=5 ./run-benchmark.sh -o synthetic-run opensearch horizon
@@ -181,9 +182,9 @@ Each run writes to a directory of its own, `runs/<timestamp>`, so that nothing o
 
 Both CSVs have the columns of `container-stats.sh`, so `avg-stats.sh` reads either. For the harness, the memory is the resident size of the JVM and its percentage is a share of the host's RAM rather than of a container limit.
 
-After the writes and again after the reads, each backend is asked how many URLs it is holding: OpenSearch through `_cat/indices`, the two frontiers through `uf get-stats --json`. A frontier reports the URLs it still has to crawl separately from the ones it has finished with, and the client gives their total, which is the figure comparable with the document count of an index, holding one document per URL whatever its status. Every backend is fed the same file, so the figures should agree. The first one measured becomes the reference, the rest are compared against it, and the difference goes into `summary.txt` either way. A backend that disagrees is a warning in `run.log` rather than a reason to stop the chain. Set `EXPECTED_URLS` to say up front what the figure should be, which is what to do when running a single backend on its own.
+After the writes and again after the reads, each backend is asked how many URLs it is holding: OpenSearch through `_cat/indices`, Solr through a query for all documents, the two frontiers through `uf get-stats --json`. A frontier reports the URLs it still has to crawl separately from the ones it has finished with, and the client gives their total, which is the figure comparable with the document count of an index, holding one document per URL whatever its status. Every backend is fed the same file, so the figures should agree. The first one measured becomes the reference, the rest are compared against it, and the difference goes into `summary.txt` either way. A backend that disagrees is a warning in `run.log` rather than a reason to stop the chain. Set `EXPECTED_URLS` to say up front what the figure should be, which is what to do when running a single backend on its own.
 
-Each backend keeps its data in a directory of its own under `bench-data`, mounted into the container, so that the space it uses can be measured with `du`. It is measured after the writes and again once the container has stopped, which is the figure to compare: RocksDB only writes out what it holds in memory on a clean shutdown, and OpenSearch keeps a translog until it is flushed. OpenSearch is flushed before being measured and its own view of the index is recorded as well.
+Each backend keeps its data in a directory of its own under `bench-data`, mounted into the container, so that the space it uses can be measured with `du`. It is measured after the writes and again once the container has stopped, which is the figure to compare: RocksDB only writes out what it holds in memory on a clean shutdown, and OpenSearch keeps a translog until it is flushed. OpenSearch is flushed and Solr committed before being measured, and their own view of the index is recorded as well.
 
 URLFrontier is run with `config.ini` mounted into its container and passed to the service with `-c`, so that the tuning it holds is what gets measured; [URLFrontier](#urlfrontier) below has the detail of the two mounts that takes. Horizon is a native binary rather than a JVM, so `HEAP` does not apply to it and it keeps the `config.ini` from its image.
 
@@ -206,6 +207,30 @@ SPOUT_CLASS=org.apache.stormcrawler.opensearch.persistence.AggregationSpout   # 
 ```
 
 The status updater creates the `status` index from `src/main/resources/status.mapping` if it doesn't exist. The spouts use sampling (`opensearch.status.sample: true`): without it, the aggregations are too slow on an index this size. Sampling looks at part of the index rather than all of it, so the URLs that come back are urgent ones rather than strictly the most urgent: with it on, the priority order is approximate.
+
+### Solr
+
+```bash
+docker run -d --name solr-bench -p 127.0.0.1:8983:8983 -e SOLR_HEAP=6g \
+  -v "$PWD/solr/status":/opt/bench-configset:ro solr:10.1.0 solr-foreground -c
+docker exec solr-bench solr zk upconfig --conf-name status --conf-dir /opt/bench-configset/conf -z localhost:9983
+curl -XPOST localhost:8983/api/collections -H 'Content-Type: application/json' -d '{
+  "name":"status","config":"status","numShards":10,"replicationFactor":1,
+  "router":{"name":"compositeId","field":"key"}}'
+```
+
+```bash
+SUP_CLASS=org.apache.stormcrawler.solr.persistence.StatusUpdaterBolt
+SPOUT_CLASS=org.apache.stormcrawler.solr.persistence.SolrSpout
+```
+
+Solr runs in SolrCloud mode with its embedded ZooKeeper, and the `status` collection is created from the configset in `solr/status`, routed on the `key` field. `SolrSpout` queries one shard per instance and fails to start unless there are as many instances as shards, so create the collection with as many shards as spouts and set `solr.status.routing.shards` to the same figure. `benchmark-conf.yaml` leaves it out: `run-benchmark.sh` creates the collection with `READ_SPOUTS` shards and passes the figure in `solr-conf.yaml`, which it writes to the output directory and gives both utilities after `benchmark-conf.yaml`. When running the utilities by hand, do the same:
+
+```bash
+printf 'config:\n  solr.status.routing.shards: 10\n' > solr-conf.yaml
+```
+
+The index size recorded in `solr-disk.txt` is the sum over the cores, from the CoreAdmin `STATUS` call.
 
 ### URLFrontier
 

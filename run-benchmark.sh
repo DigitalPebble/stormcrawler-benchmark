@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Chains the benchmark steps for every backend: baseline, OpenSearch, URLFrontier, Horizon.
+# Chains the benchmark steps for every backend: baseline, OpenSearch, Solr, URLFrontier, Horizon.
 #
 # For each backend it runs the write benchmark (StatusUpdaterBenchmark, one status updater bolt)
 # then the read one (SpoutBenchmark, several spouts against the index the writes left behind),
@@ -12,7 +12,7 @@
 #   -o, --output dir   where the logs, the CSVs and the summary go. The default is a directory of
 #                      its own per run, runs/<timestamp>; what a run writes into a directory that
 #                      already holds files replaces what is there.
-#   backend...         baseline, opensearch, urlfrontier or horizon, all four by default,
+#   backend...         baseline, opensearch, solr, urlfrontier or horizon, all five by default,
 #                      in that order
 #
 # Each step leaves these files in the output directory:
@@ -29,17 +29,22 @@
 # the service with -c, so the tuning it holds is what the benchmark measures. Its rocksdb.path must
 # stay under /data/crawl, which is where the data directory is mounted.
 #
+# Solr runs in SolrCloud mode with its embedded ZooKeeper. The status configset in solr/status is
+# uploaded to it and the collection created with READ_SPOUTS shards, as SolrSpout needs one
+# instance per shard; the shard count is passed to both utilities in a conf file the script writes
+# to the output directory, after CONF.
+#
 # After the writes and again after the reads, each backend is asked how many URLs it is holding:
-# OpenSearch through _cat/indices, the two frontiers through `uf get-stats --json` from the
-# urlfrontier client. All three are fed the same file, so the figures should agree; the first
-# one measured becomes the reference and a backend that disagrees with it is reported as a
-# warning rather than stopping the run.
+# OpenSearch through _cat/indices, Solr through a query for all documents, the two frontiers
+# through `uf get-stats --json` from the urlfrontier client. All four are fed the same file, so
+# the figures should agree; the first one measured becomes the reference and a backend that
+# disagrees with it is reported as a warning rather than stopping the run.
 #
 # Every backend keeps its data in a directory of its own under bench-data, mounted into the
-# container, so that the space it uses can be measured with du. OpenSearch is flushed before being
-# measured and its own view of the index is kept too; for the frontiers the figure is the RocksDB
-# directory. The measurement after the container has stopped is the comparable one: the stores
-# only write out what they hold in memory when they shut down.
+# container, so that the space it uses can be measured with du. OpenSearch is flushed and Solr
+# committed before being measured and their own view of the index is kept too; for the frontiers
+# the figure is the RocksDB directory. The measurement after the container has stopped is the
+# comparable one: the stores only write out what they hold in memory when they shut down.
 #
 # Both CSVs have the columns of container-stats.sh (time,cpu_perc,mem_mib,mem_perc) so that
 # avg-stats.sh reads either. 100% of cpu_perc is one core. For the harness, mem_mib is the RSS
@@ -78,6 +83,7 @@ JAR=${JAR:-target/benchmark-0.1-SNAPSHOT.jar}
 CONF=${CONF:-benchmark-conf.yaml}
 INPUT=${INPUT:-urldump-mixed.ndjson.gz}
 UF_CONFIG=${UF_CONFIG:-config.ini}
+SOLR_CONFIGSET=${SOLR_CONFIGSET:-solr/status}
 
 WRITE_INSTANCES=${WRITE_INSTANCES:-1}
 READ_MINUTES=${READ_MINUTES:-3}
@@ -107,18 +113,20 @@ DATA_ROOT=${DATA_ROOT:-bench-data}
 OUTDIR=${OUTDIR:-runs/$(date +%Y%m%d-%H%M%S)}
 
 OS_IMAGE=${OS_IMAGE:-opensearchproject/opensearch:3.9.0}
+SOLR_IMAGE=${SOLR_IMAGE:-solr:10.1.0}
 UF_IMAGE=${UF_IMAGE:-urlfrontier:2.7-SNAPSHOT}
 HORIZON_IMAGE=${HORIZON_IMAGE:-ghcr.io/digitalpebble/horizon:0.4.0}
 WIPE_IMAGE=${WIPE_IMAGE:-alpine:latest}
 
 OS_PORT=9201
+SOLR_PORT=8983
 UF_PORT=7071
 
 WRITE_CLASS=org.apache.stormcrawler.persistence.StatusUpdaterBenchmark
 READ_CLASS=org.apache.stormcrawler.persistence.SpoutBenchmark
 
 usage() {
-  printf 'Usage: %s [-o|--output dir] [baseline|opensearch|urlfrontier|horizon ...]\n' "${0##*/}"
+  printf 'Usage: %s [-o|--output dir] [baseline|opensearch|solr|urlfrontier|horizon ...]\n' "${0##*/}"
 }
 
 BACKENDS=()
@@ -153,7 +161,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#BACKENDS[@]} -eq 0 ]]; then
-  BACKENDS=(baseline opensearch urlfrontier horizon)
+  BACKENDS=(baseline opensearch solr urlfrontier horizon)
 fi
 
 CONTAINER=
@@ -197,6 +205,13 @@ check() {
         [[ -f $INPUT ]] || die "input $INPUT not found"
         port_free "$OS_PORT" || die "something is already listening on $OS_PORT"
         ;;
+      solr)
+        [[ -f $INPUT ]] || die "input $INPUT not found"
+        [[ -f $SOLR_CONFIGSET/conf/solrconfig.xml ]] \
+          || die "$SOLR_CONFIGSET/conf/solrconfig.xml not found, the status collection is created from it"
+        port_free "$SOLR_PORT" || die "something is already listening on $SOLR_PORT"
+        command -v jq > /dev/null || die "jq is not on the PATH, the Solr figures are read as JSON"
+        ;;
       urlfrontier)
         [[ -f $INPUT ]] || die "input $INPUT not found"
         [[ -f $UF_CONFIG ]] || die "$UF_CONFIG not found, URLFrontier is run with it mounted"
@@ -209,7 +224,7 @@ check() {
         port_free "$UF_PORT" || die "something is already listening on $UF_PORT"
         need_uf_client
         ;;
-      *) die "unknown backend '$backend', expected baseline, opensearch, urlfrontier or horizon" ;;
+      *) die "unknown backend '$backend', expected baseline, opensearch, solr, urlfrontier or horizon" ;;
     esac
   done
 }
@@ -352,6 +367,17 @@ start_backend() {
         --ulimit memlock=-1:-1 --ulimit nofile=65536:65536 \
         "$OS_IMAGE" > /dev/null
       ;;
+    solr)
+      # SolrCloud with the embedded ZooKeeper, which keeps its data under /var/solr/data as well.
+      # The configset is mounted for start_solr_collection to upload once the node is up.
+      CONTAINER=solr-bench
+      docker rm -f "$CONTAINER" > /dev/null 2>&1 || true
+      docker run -d --name "$CONTAINER" -p "127.0.0.1:$SOLR_PORT:8983" \
+        -v "$data":/var/solr/data \
+        -v "$SOLR_CONFIGSET":/opt/bench-configset:ro \
+        -e "SOLR_HEAP=$HEAP" \
+        "$SOLR_IMAGE" solr-foreground -c > /dev/null
+      ;;
     urlfrontier)
       # the image has no config.ini and its entrypoint passes none, so mount ours and point
       # the service at it with -c. rocksdb.path in it must sit under the mounted data directory.
@@ -390,6 +416,12 @@ wait_ready() {
           return 0
         fi
         ;;
+      solr)
+        if curl -fsS "http://localhost:$SOLR_PORT/api/node/system" > /dev/null 2>&1; then
+          start_solr_collection
+          return 0
+        fi
+        ;;
       *)
         if ! port_free "$UF_PORT"; then
           return 0
@@ -399,6 +431,18 @@ wait_ready() {
     sleep 2
   done
   die "$backend was not ready after ${READY_TIMEOUT}s"
+}
+
+# The status collection, created from the configset with one shard per spout and routed on the
+# key, as the status updater expects
+start_solr_collection() {
+  docker exec "$CONTAINER" solr zk upconfig --conf-name status --conf-dir /opt/bench-configset/conf \
+    -z localhost:9983 > /dev/null || die "could not upload the configset to Solr"
+  curl -fsS -XPOST "http://localhost:$SOLR_PORT/api/collections" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"status\",\"config\":\"status\",\"numShards\":$READ_SPOUTS,\"replicationFactor\":1,
+         \"router\":{\"name\":\"compositeId\",\"field\":\"key\"},\"waitForFinalState\":true}" \
+    > /dev/null || die "could not create the status collection in Solr"
+  log "status collection created with $READ_SPOUTS shards"
 }
 
 stop_container() {
@@ -452,6 +496,20 @@ os_index_stats() {
   say "index (docs, deleted, store, primaries): $(printf '%s' "$line" | tr -s ' ')"
   printf 'index\t%s\n' "$(printf '%s' "$line" | tr -s ' ')" >> "$OUTDIR/$backend-disk.txt"
   check_count "$backend" "$label" "$(printf '%s' "$line" | awk '{print $1}')"
+}
+
+# what Solr itself reports, once everything sent has been committed
+solr_index_stats() {
+  local backend=$1 label=$2 count size
+  curl -fsS "http://localhost:$SOLR_PORT/solr/status/update?commit=true" > /dev/null 2>&1 || true
+  count=$(curl -fsS "http://localhost:$SOLR_PORT/solr/status/select?q=*:*&rows=0&wt=json" \
+    2> /dev/null | jq '.response.numFound' 2> /dev/null) || return 0
+  # the size of the index summed over the cores, one per shard
+  size=$(curl -fsS "http://localhost:$SOLR_PORT/solr/admin/cores?action=STATUS&wt=json" \
+    2> /dev/null | jq '[.status[].index.sizeInBytes] | add' 2> /dev/null) || size=
+  say "index (docs, bytes): $count ${size:-?}"
+  printf 'index\t%s %s\n' "$count" "${size:-?}" >> "$OUTDIR/$backend-disk.txt"
+  check_count "$backend" "$label" "$count"
 }
 
 # What the frontier itself reports, read with the urlfrontier client over the published port. The
@@ -668,7 +726,7 @@ summarise() {
 }
 
 run_backend() {
-  local backend=$1 sup spout data="$DATA_ROOT/$1"
+  local backend=$1 sup spout data="$DATA_ROOT/$1" confs=("$CONF")
 
   case $backend in
     baseline)
@@ -678,6 +736,12 @@ run_backend() {
     opensearch)
       sup=org.apache.stormcrawler.opensearch.persistence.StatusUpdaterBolt
       spout=org.apache.stormcrawler.opensearch.persistence.HybridSpout
+      ;;
+    solr)
+      sup=org.apache.stormcrawler.solr.persistence.StatusUpdaterBolt
+      spout=org.apache.stormcrawler.solr.persistence.SolrSpout
+      printf 'config:\n  solr.status.routing.shards: %s\n' "$READ_SPOUTS" > "$OUTDIR/solr-conf.yaml"
+      confs+=("$OUTDIR/solr-conf.yaml")
       ;;
     urlfrontier | horizon)
       sup=org.apache.stormcrawler.urlfrontier.StatusUpdaterBolt
@@ -697,10 +761,11 @@ run_backend() {
     log "$backend is up"
   fi
 
-  run_step "$backend-writes" "$WRITE_CLASS" "$sup" "$WRITE_INSTANCES" "$CONF" "$INPUT"
+  run_step "$backend-writes" "$WRITE_CLASS" "$sup" "$WRITE_INSTANCES" "${confs[@]}" "$INPUT"
 
   case $backend in
     opensearch) os_index_stats "$backend" "after the writes" ;;
+    solr) solr_index_stats "$backend" "after the writes" ;;
     urlfrontier | horizon) frontier_stats "$backend" "after the writes" ;;
   esac
   measure_disk "$backend" "after the writes"
@@ -718,12 +783,13 @@ run_backend() {
       fi
     fi
     run_step "$backend-reads" "$READ_CLASS" \
-      "$spout" "$sup" "$READ_MINUTES" "$READ_SPOUTS" "$READ_BOLTS" "$CONF"
+      "$spout" "$sup" "$READ_MINUTES" "$READ_SPOUTS" "$READ_BOLTS" "${confs[@]}"
   fi
 
   if [[ -n $CONTAINER ]]; then
     case $backend in
       opensearch) os_index_stats "$backend" "after the reads" ;;
+      solr) solr_index_stats "$backend" "after the reads" ;;
       urlfrontier | horizon) frontier_stats "$backend" "after the reads" ;;
     esac
     docker logs "$CONTAINER" > "$OUTDIR/$backend-container.log" 2>&1 || true
@@ -759,6 +825,9 @@ DATA_ROOT=$(cd "$DATA_ROOT" && pwd)
 if [[ -f $UF_CONFIG ]]; then
   UF_CONFIG=$(readlink -f "$UF_CONFIG")
 fi
+if [[ -d $SOLR_CONFIGSET ]]; then
+  SOLR_CONFIGSET=$(cd "$SOLR_CONFIGSET" && pwd)
+fi
 
 trap cleanup EXIT
 trap 'log "interrupted"; exit 130' INT TERM
@@ -791,12 +860,12 @@ fi
   echo "docker $(docker version --format '{{.Server.Version}}')"
   echo "backends: ${BACKENDS[*]}"
   echo "input: $INPUT ($(du -h "$INPUT" | cut -f1))"
-  echo "conf: $CONF, URLFrontier config: $UF_CONFIG"
+  echo "conf: $CONF, URLFrontier config: $UF_CONFIG, Solr configset: $SOLR_CONFIGSET"
   echo "heap of every JVM backend: $HEAP (Horizon is a native binary, no heap to set)"
   echo "writes: $WRITE_INSTANCES status updater(s)"
   echo "reads: $READ_SPOUTS spout(s), $READ_BOLTS status updater(s), $READ_MINUTES min"
   echo "settle between writes and reads: ${SETTLE_SECS}s, drop_caches: $DROP_CACHES, swapoff: $SWAPOFF"
-  echo "images: $OS_IMAGE, $UF_IMAGE, $HORIZON_IMAGE"
+  echo "images: $OS_IMAGE, $SOLR_IMAGE, $UF_IMAGE, $HORIZON_IMAGE"
 } >> "$OUTDIR/summary.txt"
 
 log "run directory $OUTDIR"
