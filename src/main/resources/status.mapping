@@ -3,7 +3,11 @@
 		"index": {
 			"number_of_shards": 10,
 			"number_of_replicas": 0,
-			"refresh_interval": "5s"
+			"refresh_interval": "5s",
+			"translog": {
+			    "durability": "async",
+				"sync_interval": "5s"
+		    }
 		}
 	},
 	"mappings": {
