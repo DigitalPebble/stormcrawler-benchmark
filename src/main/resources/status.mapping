@@ -6,7 +6,7 @@
 			"refresh_interval": "5s",
 			"translog": {
 			    "durability": "async",
-				"sync_interval": "5s"
+				"sync_interval": "1s"
 		    }
 		}
 	},
@@ -16,7 +16,8 @@
 					"path_match": "metadata.*",
 					"match_mapping_type": "string",
 					"mapping": {
-						"type": "keyword"
+						"type": "keyword",
+						"ignore_above": 8191
 					}
 				}
 			}],
@@ -36,7 +37,8 @@
 					"type": "keyword"
 				},
 				"url": {
-					"type": "keyword"
+					"type": "keyword",
+					"ignore_above": 8191
 				}
 			}
 	}
