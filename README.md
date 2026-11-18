@@ -101,6 +101,22 @@ sudo swapoff -a
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 ```
 
+#### Turbo boost (Linux)
+
+Turbo lets the CPU run above its base clock when there is power and thermal headroom, so the speed depends on temperature and on what ran just before. That makes runs hard to compare, and on a laptop with a weak charger it can trigger a firmware cap of about 400 MHz. For stable numbers, turn it off for the benchmark and back on afterwards. The change is lost at reboot:
+
+```bash
+# Intel (intel_pstate)
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo   # off
+echo 0 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo   # back on
+
+# AMD and others (cpufreq boost)
+echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost           # off
+echo 1 | sudo tee /sys/devices/system/cpu/cpufreq/boost           # back on
+```
+
+`run-benchmark.sh` records the setting in `summary.txt`, and warns if the CPU is throttled. It doesn't change it itself. There is no equivalent on macOS.
+
 #### macOS
 
 `run-benchmark.sh` runs on macOS with Docker Desktop, where the containers run in a Linux VM rather than on the host, which changes a few things:

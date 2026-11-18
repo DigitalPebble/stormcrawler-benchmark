@@ -688,6 +688,18 @@ stop_stats() {
 
 # ---------------------------------------------------------------- steps
 
+# Whether the CPU may boost above its base clock, the clocks of a run depend on it
+turbo_state() {
+  local f=/sys/devices/system/cpu
+  if [[ -r $f/intel_pstate/no_turbo ]]; then
+    if [[ $(< "$f/intel_pstate/no_turbo") == 1 ]]; then echo off; else echo on; fi
+  elif [[ -r $f/cpufreq/boost ]]; then
+    if [[ $(< "$f/cpufreq/boost") == 0 ]]; then echo off; else echo on; fi
+  else
+    echo unknown
+  fi
+}
+
 # Short all-core load, then read the clock: an idle CPU is slow by design, a loaded one that stays
 # slow is throttled (underpowered USB-C charger, power saving mode, thermals). Warns, never aborts.
 # Linux only, macOS has no unprivileged clock reading
@@ -884,6 +896,7 @@ fi
     echo "docker VM: $(docker info --format '{{.NCPU}} threads, {{.MemTotal}} bytes RAM')"
   else
     echo "kernel $(uname -r), $(nproc) threads, $(free -g | awk '/^Mem:/ {print $2}') GiB RAM"
+    echo "turbo: $(turbo_state)"
   fi
   if [[ -n $CPU_SPEED_INFO ]]; then echo "$CPU_SPEED_INFO"; fi
   if (( CPU_SPEED_WARN )); then echo "WARNING: CPU throttled during the check"; fi
