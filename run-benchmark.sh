@@ -688,6 +688,38 @@ stop_stats() {
 
 # ---------------------------------------------------------------- steps
 
+# Whether the CPU may boost above its base clock, the clocks of a run depend on it
+turbo_state() {
+  local f=/sys/devices/system/cpu
+  if [[ -r $f/intel_pstate/no_turbo ]]; then
+    if [[ $(< "$f/intel_pstate/no_turbo") == 1 ]]; then echo off; else echo on; fi
+  elif [[ -r $f/cpufreq/boost ]]; then
+    if [[ $(< "$f/cpufreq/boost") == 0 ]]; then echo off; else echo on; fi
+  else
+    echo unknown
+  fi
+}
+
+# Short all-core load, then read the clock: an idle CPU is slow by design, a loaded one that stays
+# slow is throttled (underpowered USB-C charger, power saving mode, thermals). Warns, never aborts.
+# Linux only, macOS has no unprivileged clock reading
+cpu_speed_check() {
+  local pids=() i mhz max
+  if (( DARWIN )); then return 0; fi
+  for ((i = 0; i < $(nproc); i++)); do
+    yes > /dev/null &
+    pids+=("$!")
+  done
+  sleep 4
+  mhz=$(awk '/^cpu MHz/ {s += $4; c++} END {if (c) printf "%d", s / c}' /proc/cpuinfo)
+  max=$(awk '{printf "%d", $1 / 1000}' /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2> /dev/null)
+  CPU_SPEED_INFO="CPU clock under load: ${mhz:-unknown} MHz average, ${max:-unknown} MHz max"
+  if [[ -n $mhz && -n $max ]] && (( max > 0 && mhz * 2 < max )); then CPU_SPEED_WARN=1; fi
+  kill "${pids[@]}" 2> /dev/null || true
+  wait "${pids[@]}" 2> /dev/null || true
+}
+
+
 run_step() {
   local step=$1 class=$2
   shift 2
@@ -849,6 +881,14 @@ if (( SWAPOFF )); then
   log "swap off"
 fi
 
+CPU_SPEED_INFO=""
+CPU_SPEED_WARN=0
+cpu_speed_check
+if [[ -n $CPU_SPEED_INFO ]]; then log "$CPU_SPEED_INFO"; fi
+if (( CPU_SPEED_WARN )); then
+  log "WARNING: the CPU is throttled, results will be far slower than normal (use the original charger, a performance power mode, check thermals)"
+fi
+
 {
   echo "# $(date +%Y-%m-%dT%H:%M:%S%z)  $(hostname)"
   if (( DARWIN )); then
@@ -856,7 +896,10 @@ fi
     echo "docker VM: $(docker info --format '{{.NCPU}} threads, {{.MemTotal}} bytes RAM')"
   else
     echo "kernel $(uname -r), $(nproc) threads, $(free -g | awk '/^Mem:/ {print $2}') GiB RAM"
+    echo "turbo: $(turbo_state)"
   fi
+  if [[ -n $CPU_SPEED_INFO ]]; then echo "$CPU_SPEED_INFO"; fi
+  if (( CPU_SPEED_WARN )); then echo "WARNING: CPU throttled during the check"; fi
   echo "docker $(docker version --format '{{.Server.Version}}')"
   echo "backends: ${BACKENDS[*]}"
   echo "input: $INPUT ($(du -h "$INPUT" | cut -f1))"
