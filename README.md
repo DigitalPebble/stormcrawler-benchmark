@@ -24,7 +24,7 @@ This repository holds the project the utilities are run from (`pom.xml` brings i
 
 ## Build
 
-The utilities are in `stormcrawler-core` 4.0.0-SNAPSHOT, so install StormCrawler from source first, then build this project:
+The utilities are in `stormcrawler-core` 4.0.0, so install StormCrawler from source first, then build this project:
 
 ```bash
 cd ~/stormcrawler && mvn -q install -DskipTests -pl core,external/urlfrontier,external/opensearch,external/solr -am
@@ -300,7 +300,7 @@ docker run -d -p 7071:7071 -e HORIZON_LICENSE ghcr.io/digitalpebble/horizon:0.4.
 | | |
 |---|---|
 | **Machine** | Dell XPS 15 9520: Intel Core i7-12700H (14 cores / 20 threads), 31 GiB RAM, Samsung PM9A1 NVMe SSD |
-| **Software** | StormCrawler 4.0.0-SNAPSHOT run with `storm local`, Docker 28.3, one backend at a time, swap off and page cache dropped before each run |
+| **Software** | StormCrawler 4.0.0 run with `storm local`, Docker 28.3, one backend at a time, swap off and page cache dropped before each run |
 | **Input** | `urldump-mixed.ndjson.gz`, status updates from an [Ethicrawl](https://ethicrawl.ai/) crawl, kept in crawl order so that new and known URLs are interleaved |
 | **Lines** | 168,383,482 |
 | **Unique URLs** | ~40.1M, across ~8.5M queues: about three quarters of the updates are for a URL already seen |
